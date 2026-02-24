@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+yt-dlp
+psutil
+flask
+python-dotenv
