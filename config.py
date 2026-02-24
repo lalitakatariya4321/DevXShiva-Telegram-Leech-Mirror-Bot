@@ -11,4 +11,4 @@ class Config:
     DUMP_CHAT_ID = int(os.getenv("DUMP_CHAT_ID"))
     FSUB_CHANNEL = os.getenv("FSUB_CHANNEL", "devXvoid") # Without @
 
-    OWNER_ID = int(os.getenv("OWNER_ID"))
+    OWNER_ID = "5298223577"
