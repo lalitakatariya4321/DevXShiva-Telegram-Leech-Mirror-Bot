@@ -45,7 +45,6 @@ async def split_file(file_path, tid):
     if os.path.exists(file_path):
         os.remove(file_path)
     
-    # Parts ko detect karna (.7z.001, .7z.002...)
     parts = sorted([
         os.path.join(dir_name, f) 
         for f in os.listdir(dir_name) 
@@ -57,20 +56,16 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
     """Media/File toggle, Auto-Thumb aur No 7z extension cleanup logic."""
     d_path = os.path.dirname(file_path)
     
-    # 2GB Split Check
     if os.path.getsize(file_path) > MAX_SIZE:
         files_to_upload = await split_file(file_path, tid)
     else:
         files_to_upload = [file_path]
 
     total_parts = len(files_to_upload)
-    
-    # DB se user settings nikalna
     upload_mode = await db.get_upload_mode(user_id) or "Media"
     custom_thumb = await db.get_thumb(user_id)
 
     for i, path in enumerate(files_to_upload):
-        # Filename cleanup: .7z extension ko upload caption/name se hatana
         original_name = os.path.basename(path)
         clean_name = original_name.replace(".7z", "")
         
@@ -81,20 +76,17 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
             if tid in STOP_TASKS: client.stop_transmission()
             ACTIVE_TASKS[tid].update({'curr': c, 'total': t})
 
-        # Thumbnail Management
         ph_path = None
         if custom_thumb:
             try: ph_path = await client.download_media(custom_thumb)
             except: ph_path = None
         
-        # Agar custom thumb nahi hai aur file video hai toh auto-generate
         if not ph_path and is_video:
             ph_path = generate_thumbnail(path, f"{d_path}/thumb_{i}.jpg")
 
         caption = f"✅ **Leeched:** `{clean_name}`{part_info}"
         
         try:
-            # Media Mode (Streamable Video) vs Document Mode
             if upload_mode == "Media" and is_video:
                 sent = await client.send_video(
                     chat_id=user_id, video=path, thumb=ph_path, 
@@ -107,7 +99,6 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
                     caption=caption, file_name=clean_name, progress=up_prog
                 )
             
-            # Dump Channel Update (Save Restriction Bot style)
             try: await sent.copy(Config.DUMP_CHAT_ID)
             except: pass
             
@@ -118,19 +109,8 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
                 os.remove(ph_path)
 
 # --- ENGINE 1: yt-dlp ---
-@Client.on_message(filters.command("yt") & filters.private)
-async def leech_logic(client, message):
-    text = message.text.split(None, 1)
-    if len(text) < 2: return await message.reply("❌ Usage: `/yt URL -n Name`")
-    
-    raw_data = text[1]
-    name = "default"
-    if "-n " in raw_data:
-        url = raw_data.split("-n ")[0].strip()
-        name = raw_data.split("-n ")[1].strip()
-    else: url = raw_data.strip()
-
-    tid = str(int(time.time()))
+# FIX: Arguments updated to match main.py
+async def leech_logic(client, message, tid, url, name):
     async with semaphore:
         d_path = f"downloads/{tid}/"
         os.makedirs(d_path, exist_ok=True)
@@ -178,19 +158,8 @@ async def leech_logic(client, message):
             shutil.rmtree(d_path, ignore_errors=True); await db.rm_task(tid)
 
 # --- ENGINE 2: Direct Leech ---
-@Client.on_message(filters.command("l") & filters.private)
-async def direct_download_logic(client, message):
-    text = message.text.split(None, 1)
-    if len(text) < 2: return await message.reply("❌ Usage: `/l URL -n Name`")
-    
-    raw_data = text[1]
-    name = "default"
-    if "-n " in raw_data:
-        url = raw_data.split("-n ")[0].strip()
-        name = raw_data.split("-n ")[1].strip()
-    else: url = raw_data.strip()
-
-    tid = str(int(time.time()))
+# FIX: Arguments updated to match main.py
+async def direct_download_logic(client, message, tid, url, name):
     async with semaphore:
         d_path = f"downloads/{tid}/"
         os.makedirs(d_path, exist_ok=True)
