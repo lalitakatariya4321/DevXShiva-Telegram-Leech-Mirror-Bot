@@ -22,10 +22,11 @@ async def get_status_msg(ACTIVE_TASKS):
         msg += f"📦 `{t['name']}`\n"
         msg += f"┃ 〖{get_progress_bar(percent)}〗 {percent:.2f}%\n"
         msg += f"┠ Processed: {humanbytes(t['curr'])} of {humanbytes(t['total'])}\n"
-        msg += f"┠ Status: {t['status']} }\n"
+        msg += f"┠ Status: {t['status']}\n"
         msg += f"┠ Speed: {t['speed']} | Elapsed: {time.strftime('%M:%S', time.gmtime(elapsed))}\n"
         msg += f"┠ Engine: yt-dlp Pro\n"
         msg += f"┠ User: {t['user_name']} | ID: {t['user_id']}\n"
         msg += f"┖ /cancel_{tid}\n\n"
 
     return msg
+
