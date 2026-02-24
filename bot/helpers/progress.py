@@ -22,15 +22,10 @@ async def get_status_msg(ACTIVE_TASKS):
         msg += f"📦 `{t['name']}`\n"
         msg += f"┃ 〖{get_progress_bar(percent)}〗 {percent:.2f}%\n"
         msg += f"┠ Processed: {humanbytes(t['curr'])} of {humanbytes(t['total'])}\n"
-        msg += f"┠ Status: {t['status']} | ETA: {t['eta']}\n"
+        msg += f"┠ Status: {t['status']} }\n"
         msg += f"┠ Speed: {t['speed']} | Elapsed: {time.strftime('%M:%S', time.gmtime(elapsed))}\n"
         msg += f"┠ Engine: yt-dlp Pro\n"
         msg += f"┠ User: {t['user_name']} | ID: {t['user_id']}\n"
         msg += f"┖ /cancel_{tid}\n\n"
 
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
-    msg += "⌬ **Bot Stats**\n"
-    msg += f"┠ CPU: {cpu}% | RAM: {ram}%\n"
-    msg += f"┖ UPTIME: {time.strftime('%Hh %Mm %Ss', time.gmtime(time.time() - psutil.boot_time()))}"
     return msg
