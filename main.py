@@ -12,7 +12,7 @@ app = Client("leech_bot", Config.API_ID, Config.API_HASH, bot_token=Config.BOT_T
 web_app = Flask(__name__)
 
 # --- CONFIGURATION ---
-START_IMG = "https://graph.org/file/your-image-url-here.jpg" # Apna Image URL yahan dalein
+START_IMG = "LOGO.png" # Apna Image URL yahan dalein
 LOG_CHANNEL = -1002686058050 # Apna Log Channel ID yahan dalein
 
 @web_app.route('/')
@@ -178,4 +178,5 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(run())
+
 
