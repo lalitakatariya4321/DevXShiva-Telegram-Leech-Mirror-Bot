@@ -2,12 +2,26 @@ import os, asyncio, yt_dlp, time, shutil
 from pyrogram import Client, filters
 from bot.config import Config
 from bot.helpers.ffmpeg import generate_thumbnail
-from bot.helpers.database import db  # Database helper imported
+from bot.helpers.database import db
+from bot.helpers.progress import get_status_msg # Progress dashboard helper
 
 # Global Tasks Tracking
 ACTIVE_TASKS = {}
 STOP_TASKS = []
 semaphore = asyncio.Semaphore(5)
+
+async def status_updater(msg, tid):
+    """Background task jo message ko har 4-5 second mein edit karega."""
+    while tid in ACTIVE_TASKS:
+        try:
+            # Sirf current task ka status fetch karna
+            status_text = await get_status_msg({tid: ACTIVE_TASKS[tid]})
+            # Edit tabhi karein jab text change ho (FloodWait se bachne ke liye)
+            await msg.edit_text(status_text)
+            await asyncio.sleep(4) # Telegram ki limit ke hisab se 4s safe hai
+        except Exception:
+            await asyncio.sleep(4)
+            continue
 
 async def leech_logic(client, message, tid, url, name):
     async with semaphore:
@@ -15,15 +29,22 @@ async def leech_logic(client, message, tid, url, name):
         os.makedirs(d_path, exist_ok=True)
         user_id = message.from_user.id
         
-        # 1. Task Initialization (Memory & Database)
+        # 1. Task Initialization
         ACTIVE_TASKS[tid] = {
             'name': name, 'curr': 0, 'total': 1, 'status': 'Downloading', 
             'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(),
             'user_name': message.from_user.first_name, 'user_id': user_id
         }
         
-        # Task Start: Add to MongoDB Active Tasks
         await db.add_task(tid, user_id, name)
+
+        # Pehla Status Message bhejna (Added to Queue ki jagah)
+        from bot.helpers.progress import get_status_msg
+        initial_status = await get_status_msg({tid: ACTIVE_TASKS[tid]})
+        status_msg = await message.reply_text(initial_status)
+
+        # Background updater shuru karna
+        updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         def check_cancel(d):
             if tid in STOP_TASKS:
@@ -67,7 +88,6 @@ async def leech_logic(client, message, tid, url, name):
                     client.stop_transmission()
                 ACTIVE_TASKS[tid]['curr'], ACTIVE_TASKS[tid]['total'] = current, total
 
-            # Send to PM
             sent = await client.send_video(
                 chat_id=message.chat.id, 
                 video=file_path, 
@@ -76,28 +96,23 @@ async def leech_logic(client, message, tid, url, name):
                 progress=upload_progress
             )
             
-            # Send to Dump
             await sent.copy(Config.DUMP_CHAT_ID, caption=f"👤 {message.from_user.mention}\n🔗 {url}")
-
-            # 4. Stats: Increment User Task Count on Success
             await db.increment_task_stat(user_id)
+            
+            # Success par status message delete kar sakte hain ya "Completed" likh sakte hain
+            await status_msg.edit_text(f"✅ **Leech Completed:** `{name}`")
 
         except Exception as e:
-            await message.reply(f"❌ **Task Error/Stopped:** `{str(e)}`")
+            await status_msg.edit_text(f"❌ **Task Error/Stopped:** `{str(e)}`")
             
         finally:
-            # --- AUTO-CLEANUP LAYER (Memory, Disk, DB) ---
+            # Background updater band karna
+            updater_task.cancel()
             
-            # Remove from Global Dict
+            # --- AUTO-CLEANUP LAYER ---
             ACTIVE_TASKS.pop(tid, None)
-            
-            # Clear Cancel list
             if tid in STOP_TASKS: 
                 STOP_TASKS.remove(tid)
-            
-            # Delete Local Files
             if os.path.exists(d_path):
                 shutil.rmtree(d_path, ignore_errors=True)
-            
-            # Task Finish/Cancel: Remove from MongoDB Active Tasks
             await db.rm_task(tid)
