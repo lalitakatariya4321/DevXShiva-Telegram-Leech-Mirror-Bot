@@ -6,13 +6,12 @@ from bot.helpers.database import db
 from bot.helpers.progress import get_status_msg 
 
 # Global Settings
-MAX_SIZE = 1.9 * 1024 * 1024 * 1024 # 1.9GB (Safety margin for Telegram 2GB limit)
+MAX_SIZE = 1.9 * 1024 * 1024 * 1024 # 1.9GB
 ACTIVE_TASKS = {}
 STOP_TASKS = []
 semaphore = asyncio.Semaphore(5)
 
 async def status_updater(msg, tid):
-    """Background task jo message ko har 4-5 second mein edit karega."""
     while tid in ACTIVE_TASKS:
         try:
             status_text = await get_status_msg({tid: ACTIVE_TASKS[tid]})
@@ -29,11 +28,15 @@ def get_readable_time(seconds):
     return f"{m}m {s}s"
 
 async def split_file(file_path, tid):
-    """Badi file ko 2GB parts mein todne ke liye subprocess use karta hai."""
+    """Badi file ko Linux-friendly 7z command se split karne ke liye."""
     ACTIVE_TASKS[tid]['status'] = "Splitting File..."
-    base_name = file_path
-    # 7z split command: split into parts of MAX_SIZE
-    cmd = ["7z", "s", f"-v{int(MAX_SIZE)}b", "a", f"{base_name}.7z", file_path]
+    base_name = os.path.basename(file_path)
+    dir_name = os.path.dirname(file_path)
+    
+    # Linux Command: a (Add/Archive), -v (Volume Size), -mx0 (No Compression - Super Fast)
+    split_size = f"{int(MAX_SIZE)}b"
+    output_7z = f"{file_path}.7z"
+    cmd = ["7z", "a", f"-v{split_size}", "-mx0", output_7z, file_path]
     
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -41,18 +44,23 @@ async def split_file(file_path, tid):
     stdout, stderr = await process.communicate()
     
     if process.returncode != 0:
-        raise Exception(f"Split Error: {stderr.decode()}")
+        err = stderr.decode()
+        print(f"Split Error: {err}")
+        raise Exception(f"Split Error: {err}")
     
-    # Original file delete kar do taaki space bache
-    os.remove(file_path)
+    # Original badi file delete karein
+    if os.path.exists(file_path):
+        os.remove(file_path)
     
-    # Split parts ki list return karo
-    dir_name = os.path.dirname(file_path)
-    parts = sorted([os.path.join(dir_name, f) for f in os.listdir(dir_name) if f.startswith(os.path.basename(base_name) + ".7z")])
+    # Parts ki list scan karein (.001, .002 formats)
+    parts = sorted([
+        os.path.join(dir_name, f) 
+        for f in os.listdir(dir_name) 
+        if f.startswith(base_name + ".7z")
+    ])
     return parts
 
 async def common_upload_logic(client, user_id, tid, file_path, name, url, is_video):
-    """Dono engines ke liye common upload function."""
     d_path = os.path.dirname(file_path)
     
     # 2GB Check
@@ -71,14 +79,14 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
             if tid in STOP_TASKS: client.stop_transmission()
             ACTIVE_TASKS[tid].update({'curr': c, 'total': t})
 
-        # Thumbnail logic
-        thumb = generate_thumbnail(path, f"{d_path}/thumb_{i}.jpg") if is_video and not path.endswith('.001') else None
-        
-        # Agar split file hai toh Document hi bhejenge safely
+        # Thumbnail only for full video, not for split parts (to avoid errors)
+        thumb = None
         if is_video and total_parts == 1:
+            thumb = generate_thumbnail(path, f"{d_path}/thumb.jpg")
             sent = await client.send_video(chat_id=user_id, video=path, thumb=thumb,
                                           caption=f"✅ **Leeched:** `{os.path.basename(path)}`", progress=up_prog)
         else:
+            # Split parts as Documents for safety
             sent = await client.send_document(chat_id=user_id, document=path, 
                                              caption=f"✅ **Leeched:** `{os.path.basename(path)}` {part_info}", progress=up_prog)
         
