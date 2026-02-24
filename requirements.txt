@@ -3,6 +3,6 @@ tgcrypto
 yt-dlp
 motor
 dnspython
-psutil
+aiohttp
 flask
 python-dotenv
