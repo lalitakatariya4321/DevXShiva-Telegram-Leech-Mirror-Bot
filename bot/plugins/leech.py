@@ -28,7 +28,7 @@ def get_readable_time(seconds):
     return f"{m}m {s}s"
 
 async def split_file(file_path, tid):
-    """Badi file ko Linux-friendly 7z command se split karne ke liye."""
+    """Badi file ko 7z se split karna aur parts ki list return karna."""
     ACTIVE_TASKS[tid]['status'] = "Splitting File..."
     base_name = os.path.basename(file_path)
     dir_name = os.path.dirname(file_path)
@@ -45,6 +45,7 @@ async def split_file(file_path, tid):
     if os.path.exists(file_path):
         os.remove(file_path)
     
+    # Parts ko detect karna (.7z.001, .7z.002...)
     parts = sorted([
         os.path.join(dir_name, f) 
         for f in os.listdir(dir_name) 
@@ -53,10 +54,10 @@ async def split_file(file_path, tid):
     return parts
 
 async def common_upload_logic(client, user_id, tid, file_path, name, url, is_video):
-    """Media/File toggle, Auto-Thumb aur No 7z extension ke sath upload logic."""
+    """Media/File toggle, Auto-Thumb aur No 7z extension cleanup logic."""
     d_path = os.path.dirname(file_path)
     
-    # 2GB Check
+    # 2GB Split Check
     if os.path.getsize(file_path) > MAX_SIZE:
         files_to_upload = await split_file(file_path, tid)
     else:
@@ -64,12 +65,12 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
 
     total_parts = len(files_to_upload)
     
-    # Fetch User Settings (Default to 'Media' if not set)
+    # DB se user settings nikalna
     upload_mode = await db.get_upload_mode(user_id) or "Media"
     custom_thumb = await db.get_thumb(user_id)
 
     for i, path in enumerate(files_to_upload):
-        # 1. Filename fix: .7z extension hide karna
+        # Filename cleanup: .7z extension ko upload caption/name se hatana
         original_name = os.path.basename(path)
         clean_name = original_name.replace(".7z", "")
         
@@ -80,24 +81,25 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
             if tid in STOP_TASKS: client.stop_transmission()
             ACTIVE_TASKS[tid].update({'curr': c, 'total': t})
 
-        # 2. Thumbnail Logic: Custom -> Auto -> None
+        # Thumbnail Management
         ph_path = None
         if custom_thumb:
             try: ph_path = await client.download_media(custom_thumb)
             except: ph_path = None
         
+        # Agar custom thumb nahi hai aur file video hai toh auto-generate
         if not ph_path and is_video:
-            # Auto-generate thumbnail if no custom thumb
             ph_path = generate_thumbnail(path, f"{d_path}/thumb_{i}.jpg")
 
         caption = f"✅ **Leeched:** `{clean_name}`{part_info}"
         
-        # 3. Upload Mode Logic: Media vs Document
         try:
+            # Media Mode (Streamable Video) vs Document Mode
             if upload_mode == "Media" and is_video:
                 sent = await client.send_video(
                     chat_id=user_id, video=path, thumb=ph_path, 
-                    caption=caption, file_name=clean_name, progress=up_prog
+                    caption=caption, file_name=clean_name, 
+                    supports_streaming=True, progress=up_prog
                 )
             else:
                 sent = await client.send_document(
@@ -105,8 +107,10 @@ async def common_upload_logic(client, user_id, tid, file_path, name, url, is_vid
                     caption=caption, file_name=clean_name, progress=up_prog
                 )
             
+            # Dump Channel Update (Save Restriction Bot style)
             try: await sent.copy(Config.DUMP_CHAT_ID)
             except: pass
+            
         except Exception as e:
             print(f"Upload Error: {e}")
         finally:
@@ -141,12 +145,16 @@ async def leech_logic(client, message):
         updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         try:
-            ydl_opts = {'format': 'best', 'outtmpl': f'{d_path}%(title)s.%(ext)s', 
-                        'progress_hooks': [lambda d: ACTIVE_TASKS[tid].update({
-                            'curr': d.get('downloaded_bytes', 0),
-                            'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1),
-                            'speed': d.get('_speed_str', '0B/s'), 'eta': d.get('_eta_str', 'N/A')
-                        }) if d['status'] == 'downloading' else None], 'quiet': True}
+            ydl_opts = {
+                'format': 'best', 
+                'outtmpl': f'{d_path}%(title)s.%(ext)s', 
+                'progress_hooks': [lambda d: ACTIVE_TASKS[tid].update({
+                    'curr': d.get('downloaded_bytes', 0),
+                    'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1),
+                    'speed': d.get('_speed_str', '0B/s'), 'eta': d.get('_eta_str', 'N/A')
+                }) if d['status'] == 'downloading' else None], 
+                'quiet': True
+            }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -154,7 +162,8 @@ async def leech_logic(client, message):
                 if name != "default":
                     ext = os.path.splitext(file_path)[1]
                     new_path = os.path.join(d_path, f"{name}{ext}")
-                    os.rename(file_path, new_path); file_path = new_path
+                    os.rename(file_path, new_path)
+                    file_path = new_path
 
             await common_upload_logic(client, user_id, tid, file_path, name, url, is_video=True)
             await db.increment_task_stat(user_id)
@@ -215,8 +224,11 @@ async def direct_download_logic(client, message):
                             f.write(chunk); dl += len(chunk)
                             elapsed = time.time() - start
                             speed = dl / elapsed if elapsed > 0 else 0
-                            ACTIVE_TASKS[tid].update({'curr': dl, 'speed': f"{speed/1024/1024:.2f} MB/s",
-                                                     'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"})
+                            ACTIVE_TASKS[tid].update({
+                                'curr': dl, 
+                                'speed': f"{speed/1024/1024:.2f} MB/s",
+                                'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"
+                            })
 
             is_vid = name.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
             await common_upload_logic(client, user_id, tid, file_path, name, url, is_video=is_vid)
