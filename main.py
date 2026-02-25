@@ -13,7 +13,7 @@ web_app = Flask(__name__)
 
 # --- CONFIGURATION ---
 START_IMG = "LOGO.png" 
-LOG_CHANNEL = Config.LOG_CHANNEL # Config se connect kiya
+LOG_CHANNEL = Config.LOG_CHANNEL 
 
 @web_app.route('/')
 def home(): return "Alive", 200
@@ -37,16 +37,12 @@ async def send_log(c, text):
 # --- LIMIT & PM CHECKS ---
 async def can_start_task(c, m):
     user_id = m.from_user.id
-    
-    # 1. Force Subscribe Check
     if not await check_fsub(c, m): return False
     
-    # 2. Private Message (PM) Check for Group Commands
     if m.chat.type != enums.ChatType.PRIVATE:
         try:
             await c.send_chat_action(user_id, enums.ChatAction.TYPING)
         except:
-            # Agar bot user ko message nahi bhej sakta (PM not started)
             await m.reply_text(
                 f"❌ {m.from_user.mention}, please start me in Private first to receive files!",
                 reply_markup=InlineKeyboardMarkup([[
@@ -55,23 +51,19 @@ async def can_start_task(c, m):
             )
             return False
 
-    # 3. Global Task Limit
     if len(ACTIVE_TASKS) >= 5:
         await m.reply_text("⚠️ **Bot Overloaded! Max 5 global tasks.**")
         return False
         
-    # 4. User Task Limit
     u_tasks = [t for t in ACTIVE_TASKS.values() if t.get('user_id') == user_id]
     if len(u_tasks) >= 2: 
         await m.reply("❌ **Limit Exceeded! You can run only 2 tasks at a time.**")
         return False
-        
     return True
 
 # --- START COMMAND ---
 @app.on_message(filters.command("start"))
 async def start_msg(c, m):
-    # User Logging
     if not await db.is_user_exist(m.from_user.id):
         await db.add_user(m.from_user.id, m.from_user.first_name)
         await send_log(c, f"🆕 **New User Started Bot**\n👤 {m.from_user.mention}\n🆔 `{m.from_user.id}`")
@@ -83,7 +75,8 @@ async def start_msg(c, m):
         "I am a powerful **Pro Leech Bot**.\n\n"
         "🚀 **Commands:**\n"
         "• `/yt URL -n Name` : Social Media Leech\n"
-        "• `/l URL -n Name` : Direct Link Leech\n"
+        "• `/l URL -n Name` : Direct Link Leech (Auto-Merge)\n"
+        "• `/l URL -e` : Extract Mode (Episode-wise)\n"
         "• `/status` : Check Tasks"
     )
     
@@ -96,12 +89,10 @@ async def start_msg(c, m):
 @app.on_callback_query()
 async def cb_handler(c, query):
     user_id = query.from_user.id
-    
     if query.data == "settings_menu":
         mode = await db.get_upload_mode(user_id) or "Media"
         thumb = await db.get_thumb(user_id)
         thumb_status = "✅ Set" if thumb else "❌ Not Set"
-        
         settings_text = (
             f"<b>⚙️ Bot Configuration</b>\n\n"
             f"<b>Upload Mode:</b> <code>{mode}</code>\n"
@@ -112,7 +103,6 @@ async def cb_handler(c, query):
         await query.message.edit_caption(caption=settings_text, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Back 🔙", callback_data="back_start")]
         ]))
-
     elif query.data == "toggle_mode":
         curr = await db.get_upload_mode(user_id) or "Media"
         new = "Document" if curr == "Media" else "Media"
@@ -120,20 +110,18 @@ async def cb_handler(c, query):
         await query.answer(f"✅ Mode: {new}", show_alert=True)
         query.data = "settings_menu"
         await cb_handler(c, query)
-
     elif query.data == "back_start":
         welcome_text = (
             f"<b>👋 Hi {query.from_user.mention}!</b>\n\n"
             "I am a powerful **Pro Leech Bot**.\n\n"
             "🚀 **Commands:**\n"
-            "• `/yt URL -n Name` : Social Media Leech\n"
-            "• `/l URL -n Name` : Direct Link Leech\n"
+            "• `/yt URL -n Name` : Social Media\n"
+            "• `/l URL -n Name` : Direct Link"
         )
         await query.message.edit_caption(caption=welcome_text, reply_markup=get_start_buttons())
-
     elif query.data == "help":
         await query.message.edit_caption(
-            caption="<b>🛠 Help Menu</b>\n\nUse `/yt` or `/l` with `-n` for custom name.",
+            caption="<b>🛠 Help Menu</b>\n\nUse `/yt` or `/l` with `-n` for custom name.\nUse `-e` with `/l` to skip merging (Zip extraction).",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="back_start")]])
         )
 
@@ -176,11 +164,27 @@ async def direct_cmd(c, m):
     if len(parts) < 2: return await m.reply("❌ Provide URL")
     
     raw = parts[1]
-    name, url = ("default", raw.split("-n ")[0].strip()) if "-n " not in raw else (raw.split("-n ")[1].strip(), raw.split("-n ")[0].strip())
+    
+    # Extract -e flag for Zip Extraction/No-Merge
+    is_extract = False
+    if " -e" in raw:
+        is_extract = True
+        raw = raw.replace(" -e", "").strip()
+
+    # Handle -n while keeping URL clean
+    if "-n " in raw:
+        url = raw.split("-n ")[0].strip()
+        name = raw.split("-n ")[1].strip()
+    else:
+        url = raw.strip()
+        name = "default"
     
     tid = str(int(time.time()))
-    await send_log(c, f"🚀 **Direct Leech Started**\n👤 {m.from_user.first_name}\n🔗 {url}")
-    asyncio.create_task(direct_download_logic(c, m, tid, url, name))
+    log_msg = f"🚀 **Direct Leech Started**\n👤 {m.from_user.first_name}\n🔗 {url}\nMode: {'Extract (-e)' if is_extract else 'Default (Merge)'}"
+    await send_log(c, log_msg)
+    
+    # Passing is_extract to the logic
+    asyncio.create_task(direct_download_logic(c, m, tid, url, name, is_extract))
 
 # --- THUMBNAIL ---
 @app.on_message(filters.command("set_thumb") & filters.private)
