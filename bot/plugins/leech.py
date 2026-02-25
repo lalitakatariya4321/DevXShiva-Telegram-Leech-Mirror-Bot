@@ -39,10 +39,39 @@ async def split_file(file_path, tid):
     if os.path.exists(file_path): os.remove(file_path)
     return sorted([os.path.join(dir_name, f) for f in os.listdir(dir_name) if f.startswith(base_name + ".7z")])
 
+async def extract_and_merge(d_path, tid):
+    """Zip files ko merge/extract karne ke liye helper."""
+    ACTIVE_TASKS[tid]['status'] = "Merging/Extracting..."
+    zip_files = sorted([f for f in os.listdir(d_path) if f.endswith(('.zip', '.7z', '.001', '.rar'))])
+    
+    if not zip_files:
+        return False
+
+    # First part ko extract karne se saare parts merge ho jate hain
+    first_part = os.path.join(d_path, zip_files[0])
+    # Extract to a temp folder inside d_path
+    ext_dir = os.path.join(d_path, "ext_temp")
+    os.makedirs(ext_dir, exist_ok=True)
+    
+    cmd = ["7z", "x", first_part, f"-o{ext_dir}", "-y"]
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    await process.communicate()
+    
+    # Purane zip files delete karein
+    for f in zip_files:
+        p = os.path.join(d_path, f)
+        if os.path.exists(p): os.remove(p)
+    
+    # Extracted files ko bahar layein
+    for root, dirs, files in os.walk(ext_dir):
+        for file in files:
+            shutil.move(os.path.join(root, file), d_path)
+    
+    shutil.rmtree(ext_dir, ignore_errors=True)
+    return True
+
 async def common_upload_logic(client, message, tid, file_path, name, is_video, status_msg):
-    """File PM mein jayegi, Status Group mein update hoga."""
     user_id = message.from_user.id
-    chat_id = message.chat.id # Group ID
     d_path = os.path.dirname(file_path)
     
     if os.path.getsize(file_path) > MAX_SIZE:
@@ -73,21 +102,17 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
         caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {message.from_user.mention}"
         
         try:
-            # UPLOAD TO PM (user_id)
             if upload_mode == "Media" and is_video:
                 sent = await client.send_video(chat_id=user_id, video=path, thumb=ph_path, caption=caption, supports_streaming=True, progress=up_prog)
             else:
                 sent = await client.send_document(chat_id=user_id, document=path, thumb=ph_path, caption=caption, file_name=clean_name, progress=up_prog)
-            
             try: await sent.copy(Config.DUMP_CHAT_ID)
             except: pass
         except Exception as e:
             print(f"Upload Error: {e}")
-            if "peer_id_invalid" in str(e).lower():
-                await status_msg.edit_text(f"❌ {message.from_user.mention}, please start me in PM first!")
-                return
         finally:
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
+            if os.path.exists(path): os.remove(path)
 
 # --- ENGINE 1: yt-dlp ---
 async def leech_logic(client, message, tid, url, name):
@@ -124,8 +149,7 @@ async def leech_logic(client, message, tid, url, name):
 
             await common_upload_logic(client, message, tid, file_path, name, True, status_msg)
             await db.increment_task_stat(user_id)
-            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Check your PM for file!**")
-
+            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done! Check PM.**")
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
         finally:
@@ -135,7 +159,7 @@ async def leech_logic(client, message, tid, url, name):
             shutil.rmtree(d_path, ignore_errors=True); await db.rm_task(tid)
 
 # --- ENGINE 2: Direct Leech ---
-async def direct_download_logic(client, message, tid, url, name):
+async def direct_download_logic(client, message, tid, url, name, is_extract):
     async with semaphore:
         d_path = f"downloads/{tid}/"
         os.makedirs(d_path, exist_ok=True)
@@ -165,10 +189,23 @@ async def direct_download_logic(client, message, tid, url, name):
                             speed = dl / elapsed if elapsed > 0 else 0
                             ACTIVE_TASKS[tid].update({'curr': dl, 'speed': f"{speed/1024/1024:.2f} MB/s", 'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"})
 
-            is_vid = name.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
-            await common_upload_logic(client, message, tid, file_path, name, is_vid, status_msg)
+            # MERGE LOGIC: Agar user ne -e NAHI lagaya, toh zip ko merge karo
+            if not is_extract:
+                await extract_and_merge(d_path, tid)
+
+            # Upload all files in the directory (Handles single or multiple episodes)
+            all_files = [os.path.join(d_path, f) for f in os.listdir(d_path) if os.path.isfile(os.path.join(d_path, f))]
+            
+            if not all_files:
+                raise Exception("No files found to upload!")
+
+            for path in all_files:
+                filename = os.path.basename(path)
+                is_vid = filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
+                await common_upload_logic(client, message, tid, path, filename, is_vid, status_msg)
+
             await db.increment_task_stat(user_id)
-            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Check your PM for file!**")
+            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Direct Leech Done! Check PM.**")
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
         finally:
