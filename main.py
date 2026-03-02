@@ -4,7 +4,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.config import Config
 from bot.helpers.fsub import check_fsub
 from bot.helpers.database import db
-from bot.plugins.leech import leech_logic, direct_download_logic, ACTIVE_TASKS, STOP_TASKS, process_leech_download
+from bot.plugins.leech import leech_logic, direct_download_logic, ACTIVE_TASKS, STOP_TASKS
 from bot.helpers.progress import get_status_msg
 from flask import Flask
 
@@ -74,7 +74,7 @@ async def start_msg(c, m):
         f"<b>👋 Hi {m.from_user.mention}!</b>\n\n"
         "I am a powerful **Pro Leech Bot**.\n\n"
         "🚀 **Commands:**\n"
-        "• `/yt URL -n Name` : Social Media Leech\n"
+        "• `/yt URL -n Name` : Social Media Leech (Auto-Best)\n"
         "• `/l URL -n Name` : Direct Link Leech (Auto-Merge)\n"
         "• `/l URL -e` : Extract Mode (Episode-wise)\n"
         "• `/user` : Custom Settings & Cookies\n"
@@ -103,7 +103,7 @@ async def user_dashboard(c, m):
         f"📂 **Upload Mode:** `{mode}`\n"
         f"🖼 **Thumbnail:** `{thumb}`\n"
         f"🍪 **Cookies.txt:** `{cook}`\n\n"
-        "**To update settings:**\n"
+        f"**To update settings:**\n"
         "• Use `/set_thumb` (Reply to photo)\n"
         "• Send a `.txt` file for Cookies"
     )
@@ -120,16 +120,7 @@ async def user_dashboard(c, m):
 async def cb_handler(c, query):
     user_id = query.from_user.id
     
-    # --- NEW: Handle Quality Selection ---
-    if query.data.startswith("dl_"):
-        _, tid, f_id = query.data.split("_", 2)
-        if tid not in ACTIVE_TASKS:
-            return await query.answer("❌ Task Expired! Send link again.", show_alert=True)
-        
-        await query.message.edit_text(f"🚀 **Starting Download... Quality ID:** `{f_id}`")
-        # Start the actual download process from leech.py
-        asyncio.create_task(process_leech_download(c, query.message, tid, f_id))
-        return
+    # --- AUTO-LEECH: Quality selection callback removed as requested ---
 
     if query.data == "settings_menu":
         mode = await db.get_upload_mode(user_id) or "Media"
@@ -249,7 +240,7 @@ def parse_args(text):
         url = text.strip()
     return url, name, is_extract
 
-# --- LEECH COMMANDS ---
+# --- LEECH COMMANDS (Auto-Start Download) ---
 @app.on_message(filters.command(["yt", "ytdl"]))
 async def yt_cmd(c, m):
     if not await can_start_task(c, m): return
@@ -258,8 +249,9 @@ async def yt_cmd(c, m):
     url, name, is_extract = parse_args(m.text.split(None, 1)[1])
     tid = str(int(time.time()))
     
-    await send_log(c, f"🎬 **YT Format Request**\n👤 {m.from_user.first_name}\n🔗 {url}")
-    # This now shows buttons instead of starting download
+    await send_log(c, f"🎬 **YT Leech (Best Qual) Started**\n👤 {m.from_user.first_name}\n🔗 {url}")
+    
+    # Ye ab buttons nahi dikhayega, seedha leech_logic start karega
     asyncio.create_task(leech_logic(c, m, tid, url, name, is_extract))
 
 @app.on_message(filters.command("l"))
@@ -273,7 +265,6 @@ async def direct_cmd(c, m):
     log_msg = f"🚀 **Direct/GDrive Started**\n👤 {m.from_user.first_name}\n🔗 {url}\nMode: {'Extract (-e)' if is_extract else 'Default (Merge)'}"
     await send_log(c, log_msg)
     
-    # Direct links typically don't have multiple quality options like YT, so we start directly
     asyncio.create_task(direct_download_logic(c, m, tid, url, name, is_extract))
 
 # --- THUMBNAIL ---
