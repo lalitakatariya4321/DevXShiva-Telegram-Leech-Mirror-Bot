@@ -1,4 +1,4 @@
-import asyncio, threading, time
+import asyncio, threading, time, os
 from pyrogram import Client, filters, idle, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.config import Config
@@ -77,6 +77,7 @@ async def start_msg(c, m):
         "• `/yt URL -n Name` : Social Media Leech\n"
         "• `/l URL -n Name` : Direct Link Leech (Auto-Merge)\n"
         "• `/l URL -e` : Extract Mode (Episode-wise)\n"
+        "• `/user` : Custom Settings & Cookies\n"
         "• `/status` : Check Tasks\n"
         "• `/cancel ID` : Stop Task"
     )
@@ -86,6 +87,31 @@ async def start_msg(c, m):
     else:
         await m.reply_text("Bot is alive! Send commands or use me in Private.")
 
+# --- USER SETTINGS DASHBOARD ---
+@app.on_message(filters.command("user") & filters.private)
+async def user_dashboard(c, m):
+    user_id = m.from_user.id
+    mode = await db.get_upload_mode(user_id) or "Media"
+    thumb = "✅ Set" if await db.get_thumb(user_id) else "❌ Not Set"
+    cook = "✅ Set" if await db.get_cookies(user_id) else "❌ Not Set"
+
+    settings_text = (
+        f"👤 **User Dashboard: {m.from_user.first_name}**\n\n"
+        f"📂 **Upload Mode:** `{mode}`\n"
+        f"🖼 **Thumbnail:** `{thumb}`\n"
+        f"🍪 **Cookies.txt:** `{cook}`\n\n"
+        "**To update settings:**\n"
+        "• Use `/set_thumb` (Reply to photo)\n"
+        "• Send a `.txt` file for Cookies"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(f"Mode: {mode}", callback_data="toggle_mode")],
+        [InlineKeyboardButton("Upload Cookies 🍪", callback_data="ask_cookies")],
+        [InlineKeyboardButton("Delete Cookies 🗑️", callback_data="del_cookies")]
+    ]
+    await m.reply(settings_text, reply_markup=InlineKeyboardMarkup(buttons))
+
 # --- CALLBACK HANDLER ---
 @app.on_callback_query()
 async def cb_handler(c, query):
@@ -93,24 +119,43 @@ async def cb_handler(c, query):
     if query.data == "settings_menu":
         mode = await db.get_upload_mode(user_id) or "Media"
         thumb = await db.get_thumb(user_id)
+        cook = await db.get_cookies(user_id)
         thumb_status = "✅ Set" if thumb else "❌ Not Set"
+        cook_status = "✅ Set" if cook else "❌ Not Set"
+        
         settings_text = (
             f"<b>⚙️ Bot Configuration</b>\n\n"
             f"<b>Upload Mode:</b> <code>{mode}</code>\n"
-            f"<b>Custom Thumb:</b> <code>{thumb_status}</code>\n\n"
+            f"<b>Custom Thumb:</b> <code>{thumb_status}</code>\n"
+            f"<b>Cookies Status:</b> <code>{cook_status}</code>\n\n"
             "• /set_thumb : Reply to photo\n"
-            "• /del_thumb : Clear thumb"
+            "• Send .txt file for cookies"
         )
         await query.message.edit_caption(caption=settings_text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Toggle Mode 📂", callback_data="toggle_mode")],
+            [InlineKeyboardButton("Upload Cookies 🍪", callback_data="ask_cookies")],
             [InlineKeyboardButton("Back 🔙", callback_data="back_start")]
         ]))
+
     elif query.data == "toggle_mode":
         curr = await db.get_upload_mode(user_id) or "Media"
         new = "Document" if curr == "Media" else "Media"
         await db.set_upload_mode(user_id, new)
         await query.answer(f"✅ Mode: {new}", show_alert=True)
+        # Refresh current menu
         query.data = "settings_menu"
         await cb_handler(c, query)
+
+    elif query.data == "ask_cookies":
+        await query.message.reply("📂 **Please send your `cookies.txt` file (Netscape format) now.**")
+        await query.answer()
+
+    elif query.data == "del_cookies":
+        await db.set_cookies(user_id, None)
+        await query.answer("🗑️ Cookies Deleted!", show_alert=True)
+        query.data = "settings_menu"
+        await cb_handler(c, query)
+
     elif query.data == "back_start":
         welcome_text = (
             f"<b>👋 Hi {query.from_user.mention}!</b>\n\n"
@@ -120,11 +165,32 @@ async def cb_handler(c, query):
             "• `/l URL -n Name` : Direct Link"
         )
         await query.message.edit_caption(caption=welcome_text, reply_markup=get_start_buttons())
+
     elif query.data == "help":
         await query.message.edit_caption(
-            caption="<b>🛠 Help Menu</b>\n\nUse `/yt` or `/l` with `-n` for custom name.\nUse `-e` with `/l` or `/yt` to skip merging (Episode-wise).",
+            caption="<b>🛠 Help Menu</b>\n\nUse `/yt` or `/l` with `-n` for custom name.\nUse `-e` with `/l` or `/yt` to skip merging (Episode-wise).\n\nSend `cookies.txt` file to use premium accounts.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="back_start")]])
         )
+
+# --- COOKIE FILE HANDLER ---
+@app.on_message(filters.document & filters.private)
+async def handle_docs(c, m):
+    if m.document.file_name.endswith(".txt"):
+        status = await m.reply("⏳ **Validating Cookies...**")
+        file_path = await m.download()
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            if "Netscape" in content or "# HTTP Cookie File" in content:
+                await db.set_cookies(m.from_user.id, content)
+                await status.edit("✅ **Cookies.txt saved successfully!** It will be used for your next `/yt` leech.")
+            else:
+                await status.edit("❌ **Invalid Format!** Please send a valid Netscape format `cookies.txt`.")
+        except Exception as e:
+            await status.edit(f"❌ **Error:** `{e}`")
+        finally:
+            if os.path.exists(file_path): os.remove(file_path)
 
 # --- ADMIN COMMANDS ---
 @app.on_message(filters.command("stats") & filters.user(Config.ADMINS))
@@ -139,7 +205,7 @@ async def broadcast_handler(c, m):
     count = 0
     async for user in users:
         try:
-            await m.reply_to_message.copy(user['id'])
+            await m.reply_to_message.copy(user['_id'])
             count += 1
         except: pass
     await m.reply(f"✅ Broadcast Done! Sent to `{count}` users.")
