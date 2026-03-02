@@ -1,4 +1,4 @@
-import os, asyncio, yt_dlp, time, shutil, aiohttp, subprocess
+import os, asyncio, yt_dlp, time, shutil, aiohttp, subprocess, re
 from pyrogram import Client, filters, enums
 from bot.config import Config
 from bot.helpers.ffmpeg import generate_thumbnail
@@ -11,8 +11,10 @@ ACTIVE_TASKS = {}
 STOP_TASKS = []
 semaphore = asyncio.Semaphore(5)
 
+# --- STATUS UPDATER ---
 async def status_updater(msg, tid):
     while tid in ACTIVE_TASKS:
+        if tid in STOP_TASKS: break
         try:
             status_text = await get_status_msg({tid: ACTIVE_TASKS[tid]})
             await msg.edit_text(status_text)
@@ -27,6 +29,19 @@ def get_readable_time(seconds):
     if h > 0: return f"{h}h {m}m {s}s"
     return f"{m}m {s}s"
 
+# --- CANCEL COMMAND HANDLER ---
+@Client.on_message(filters.command("cancel"))
+async def cancel_cmd(client, message):
+    if len(message.command) < 2:
+        return await message.reply("❌ **Usage:** `/cancel TaskID`")
+    tid = message.command[1]
+    if tid in ACTIVE_TASKS:
+        STOP_TASKS.append(tid)
+        await message.reply(f"🛑 **Task** `{tid}` **will be stopped shortly.**")
+    else:
+        await message.reply("❌ **Invalid Task ID or Task not found.**")
+
+# --- FILE PROCESSORS (SPLIT/MERGE) ---
 async def split_file(file_path, tid):
     ACTIVE_TASKS[tid]['status'] = "Splitting..."
     base_name = os.path.basename(file_path)
@@ -40,50 +55,37 @@ async def split_file(file_path, tid):
     return sorted([os.path.join(dir_name, f) for f in os.listdir(dir_name) if f.startswith(base_name + ".7z")])
 
 async def extract_and_merge(d_path, tid):
-    """Zip files ko merge/extract karne ke liye helper."""
     ACTIVE_TASKS[tid]['status'] = "Merging/Extracting..."
     zip_files = sorted([f for f in os.listdir(d_path) if f.endswith(('.zip', '.7z', '.001', '.rar'))])
-    
-    if not zip_files:
-        return False
-
-    # First part ko extract karne se saare parts merge ho jate hain
+    if not zip_files: return False
     first_part = os.path.join(d_path, zip_files[0])
-    # Extract to a temp folder inside d_path
     ext_dir = os.path.join(d_path, "ext_temp")
     os.makedirs(ext_dir, exist_ok=True)
-    
     cmd = ["7z", "x", first_part, f"-o{ext_dir}", "-y"]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     await process.communicate()
-    
-    # Purane zip files delete karein
     for f in zip_files:
         p = os.path.join(d_path, f)
         if os.path.exists(p): os.remove(p)
-    
-    # Extracted files ko bahar layein
     for root, dirs, files in os.walk(ext_dir):
-        for file in files:
-            shutil.move(os.path.join(root, file), d_path)
-    
+        for file in files: shutil.move(os.path.join(root, file), d_path)
     shutil.rmtree(ext_dir, ignore_errors=True)
     return True
 
+# --- UPLOAD LOGIC ---
 async def common_upload_logic(client, message, tid, file_path, name, is_video, status_msg):
     user_id = message.from_user.id
     d_path = os.path.dirname(file_path)
-    
     if os.path.getsize(file_path) > MAX_SIZE:
         files_to_upload = await split_file(file_path, tid)
     else:
         files_to_upload = [file_path]
-
     total_parts = len(files_to_upload)
     upload_mode = await db.get_upload_mode(user_id) or "Media"
     custom_thumb = await db.get_thumb(user_id)
 
     for i, path in enumerate(files_to_upload):
+        if tid in STOP_TASKS: break
         clean_name = os.path.basename(path).replace(".7z", "")
         part_info = f" (Part {i+1}/{total_parts})" if total_parts > 1 else ""
         ACTIVE_TASKS[tid]['status'] = f"Uploading{part_info}"
@@ -98,9 +100,8 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
             except: ph_path = None
         if not ph_path and is_video:
             ph_path = generate_thumbnail(path, f"{d_path}/thumb_{i}.jpg")
-
-        caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {message.from_user.mention}"
         
+        caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {message.from_user.mention}"
         try:
             if upload_mode == "Media" and is_video:
                 sent = await client.send_video(chat_id=user_id, video=path, thumb=ph_path, caption=caption, supports_streaming=True, progress=up_prog)
@@ -108,113 +109,117 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
                 sent = await client.send_document(chat_id=user_id, document=path, thumb=ph_path, caption=caption, file_name=clean_name, progress=up_prog)
             try: await sent.copy(Config.DUMP_CHAT_ID)
             except: pass
-        except Exception as e:
-            print(f"Upload Error: {e}")
+        except Exception: pass
         finally:
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
             if os.path.exists(path): os.remove(path)
 
-# --- ENGINE 1: yt-dlp ---
-async def leech_logic(client, message, tid, url, name):
+# --- ENGINE 1: YT-DLP (Progress Fixed) ---
+async def leech_logic(client, message, tid, url, name, is_extract=False):
     async with semaphore:
         d_path = f"downloads/{tid}/"
         os.makedirs(d_path, exist_ok=True)
         user_id = message.from_user.id
+        ACTIVE_TASKS[tid] = {'name': name, 'curr': 0, 'total': 1, 'status': 'Downloading', 'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 'user_name': message.from_user.first_name, 'user_id': user_id}
         
-        ACTIVE_TASKS[tid] = {'name': name, 'curr': 0, 'total': 1, 'status': 'Downloading', 
-                            'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(),
-                            'user_name': message.from_user.first_name, 'user_id': user_id}
+        await db.add_task(tid, user_id, name)
+        status_msg = await client.send_message(message.chat.id, "⏳ Initializing YT Leech...")
+        updater_task = asyncio.create_task(status_updater(status_msg, tid))
+
+        def ytdl_hook(d):
+            if tid in STOP_TASKS: raise Exception("Cancelled")
+            if d['status'] == 'downloading':
+                ACTIVE_TASKS[tid].update({
+                    'curr': d.get('downloaded_bytes', 0),
+                    'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1),
+                    'speed': d.get('_speed_str', '0B/s'),
+                    'eta': d.get('_eta_str', 'N/A')
+                })
+
+        try:
+            ydl_opts = {'format': 'best', 'outtmpl': f'{d_path}%(title)s.%(ext)s', 'progress_hooks': [ytdl_hook], 'quiet': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                file_path = ydl.prepare_filename(info)
+            
+            # YT-DLP mein bhi -e support (Extracting videos from zip if any)
+            if not is_extract: await extract_and_merge(d_path, tid)
+            
+            all_files = [os.path.join(d_path, f) for f in os.listdir(d_path) if os.path.isfile(os.path.join(d_path, f))]
+            for path in all_files:
+                if tid in STOP_TASKS: break
+                await common_upload_logic(client, message, tid, path, os.path.basename(path), True, status_msg)
+            
+            await db.increment_task_stat(user_id)
+            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
+        except Exception as e:
+            await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
+        finally:
+            updater_task.cancel()
+            ACTIVE_TASKS.pop(tid, None)
+            if tid in STOP_TASKS: STOP_TASKS.remove(tid)
+            shutil.rmtree(d_path, ignore_errors=True); await db.rm_task(tid)
+
+# --- ENGINE 2: DIRECT & G-DRIVE ---
+async def direct_download_logic(client, message, tid, url, name, is_extract):
+    async with semaphore:
+        d_path = f"downloads/{tid}/"
+        os.makedirs(d_path, exist_ok=True)
+        user_id = message.from_user.id
+        ACTIVE_TASKS[tid] = {'name': name if name != "default" else "Initializing...", 'curr': 0, 'total': 1, 'status': 'Downloading...', 'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 'user_name': message.from_user.first_name, 'user_id': user_id}
         
         await db.add_task(tid, user_id, name)
         status_msg = await client.send_message(message.chat.id, "⏳ Initializing...")
         updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         try:
-            ydl_opts = {
-                'format': 'best', 'outtmpl': f'{d_path}%(title)s.%(ext)s', 
-                'progress_hooks': [lambda d: ACTIVE_TASKS[tid].update({
-                    'curr': d.get('downloaded_bytes', 0),
-                    'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1),
-                    'speed': d.get('_speed_str', '0B/s'), 'eta': d.get('_eta_str', 'N/A')
-                }) if d['status'] == 'downloading' else None], 'quiet': True
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                file_path = ydl.prepare_filename(info)
-                if name != "default":
-                    ext = os.path.splitext(file_path)[1]
-                    new_path = os.path.join(d_path, f"{name}{ext}")
-                    os.rename(file_path, new_path)
-                    file_path = new_path
+            # CHECK FOR G-DRIVE
+            if "drive.google.com" in url:
+                ACTIVE_TASKS[tid]['status'] = "G-Drive Syncing..."
+                cmd = ["gdown", "--cookie", "cookies.txt", "-O", d_path, "--folder", url] if "folders" in url else ["gdown", "--cookie", "cookies.txt", "-O", d_path, url]
+                process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                await process.communicate()
+            else:
+                # DIRECT DOWNLOAD
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=None) as response:
+                        if response.status != 200: raise Exception(f"HTTP {response.status}")
+                        total_size = int(response.headers.get('content-length', 0))
+                        ACTIVE_TASKS[tid]['total'] = total_size
+                        if name == "default":
+                            cd = response.headers.get("Content-Disposition")
+                            name = cd.split("filename=")[1].strip('"') if cd and "filename=" in cd else url.split("/")[-1].split("?")[0] or "file"
+                        
+                        file_path = os.path.join(d_path, name)
+                        with open(file_path, 'wb') as f:
+                            dl = 0; start = time.time()
+                            async for chunk in response.content.iter_chunked(1024*1024):
+                                if tid in STOP_TASKS: raise Exception("Cancelled")
+                                f.write(chunk); dl += len(chunk)
+                                elapsed = time.time() - start
+                                speed = dl / elapsed if elapsed > 0 else 0
+                                ACTIVE_TASKS[tid].update({'curr': dl, 'speed': f"{speed/1024/1024:.2f} MB/s", 'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"})
 
-            await common_upload_logic(client, message, tid, file_path, name, True, status_msg)
-            await db.increment_task_stat(user_id)
-            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done! Check PM.**")
-        except Exception as e:
-            await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
-        finally:
-            updater_task.cancel()
-            await asyncio.sleep(5); await status_msg.delete()
-            ACTIVE_TASKS.pop(tid, None)
-            shutil.rmtree(d_path, ignore_errors=True); await db.rm_task(tid)
+            if not is_extract: await extract_and_merge(d_path, tid)
 
-# --- ENGINE 2: Direct Leech ---
-async def direct_download_logic(client, message, tid, url, name, is_extract):
-    async with semaphore:
-        d_path = f"downloads/{tid}/"
-        os.makedirs(d_path, exist_ok=True)
-        user_id = message.from_user.id
-        ACTIVE_TASKS[tid] = {'name': name if name != "default" else "Direct File", 'curr': 0, 'total': 1, 'status': 'Downloading...', 'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 'user_name': message.from_user.first_name, 'user_id': user_id}
-        
-        await db.add_task(tid, user_id, name)
-        status_msg = await client.send_message(message.chat.id, "⏳ Initializing Direct...")
-        updater_task = asyncio.create_task(status_updater(status_msg, tid))
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=None) as response:
-                    if response.status != 200: raise Exception(f"HTTP {response.status}")
-                    if name == "default":
-                        cd = response.headers.get("Content-Disposition")
-                        name = cd.split("filename=")[1].strip('"') if cd and "filename=" in cd else url.split("/")[-1].split("?")[0] or "file"
-                    file_path = os.path.join(d_path, name)
-                    total_size = int(response.headers.get('content-length', 0))
-                    ACTIVE_TASKS[tid]['total'] = total_size
-                    with open(file_path, 'wb') as f:
-                        dl = 0; start = time.time()
-                        async for chunk in response.content.iter_chunked(1024*1024):
-                            if tid in STOP_TASKS: raise Exception("Cancelled")
-                            f.write(chunk); dl += len(chunk)
-                            elapsed = time.time() - start
-                            speed = dl / elapsed if elapsed > 0 else 0
-                            ACTIVE_TASKS[tid].update({'curr': dl, 'speed': f"{speed/1024/1024:.2f} MB/s", 'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"})
-
-            # MERGE LOGIC: Agar user ne -e NAHI lagaya, toh zip ko merge karo
-            if not is_extract:
-                await extract_and_merge(d_path, tid)
-
-            # Upload all files in the directory (Handles single or multiple episodes)
             all_files = [os.path.join(d_path, f) for f in os.listdir(d_path) if os.path.isfile(os.path.join(d_path, f))]
-            
-            if not all_files:
-                raise Exception("No files found to upload!")
-
             for path in all_files:
-                filename = os.path.basename(path)
-                is_vid = filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
-                await common_upload_logic(client, message, tid, path, filename, is_vid, status_msg)
+                if tid in STOP_TASKS: break
+                await common_upload_logic(client, message, tid, path, os.path.basename(path), True, status_msg)
 
             await db.increment_task_stat(user_id)
-            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Direct Leech Done! Check PM.**")
+            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
         except Exception as e:
             await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
         finally:
             updater_task.cancel()
-            await asyncio.sleep(5); await status_msg.delete()
             ACTIVE_TASKS.pop(tid, None)
+            if tid in STOP_TASKS: STOP_TASKS.remove(tid)
             shutil.rmtree(d_path, ignore_errors=True); await db.rm_task(tid)
 
+# --- STATUS COMMAND ---
 @Client.on_message(filters.command("status"))
 async def status_cmd(client, message):
-    if not ACTIVE_TASKS: return await message.reply_text("❌ No active tasks!")
-    await message.reply_text(await get_status_msg(ACTIVE_TASKS))
+    if not ACTIVE_TASKS: return await message.reply_text("❌ **No active tasks!**")
+    status_text = await get_status_msg(ACTIVE_TASKS)
+    await message.reply_text(status_text)
