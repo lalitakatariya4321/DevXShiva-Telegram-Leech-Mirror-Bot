@@ -1,5 +1,6 @@
 import os, asyncio, yt_dlp, time, shutil, aiohttp, subprocess, re
 from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from bot.config import Config
 from bot.helpers.ffmpeg import generate_thumbnail
 from bot.helpers.database import db
@@ -109,8 +110,7 @@ async def extract_and_merge(d_path, tid, user_id):
     return True
 
 # --- UPLOAD LOGIC ---
-async def common_upload_logic(client, message, tid, file_path, name, is_video, status_msg):
-    user_id = message.from_user.id
+async def common_upload_logic(client, user_id, tid, file_path, name, is_video, mention):
     d_path = os.path.dirname(file_path)
     if os.path.getsize(file_path) > MAX_SIZE:
         files_to_upload = await split_file(file_path, tid)
@@ -139,7 +139,7 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
         if not ph_path and is_video:
             ph_path = generate_thumbnail(path, f"{d_path}/thumb_{i}.jpg")
         
-        caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {message.from_user.mention}"
+        caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {mention}"
         try:
             if upload_mode == "Media" and is_video:
                 sent = await client.send_video(chat_id=user_id, video=path, thumb=ph_path, caption=caption, supports_streaming=True, progress=up_prog)
@@ -152,52 +152,105 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
             if os.path.exists(path): os.remove(path)
 
-# --- ENGINE 1: YT-DLP (Updated with Cookies & HLS Fix) ---
+# --- ENGINE 1: YT-DLP WITH FORMAT SELECTION ---
 async def leech_logic(client, message, tid, url, name, is_extract=False):
+    user_id = message.from_user.id
+    status_msg = await client.send_message(message.chat.id, "🔍 **Extracting Formats... Please wait.**")
+    
+    user_cookies = await db.get_cookies(user_id)
+    cookie_path = f"downloads/cookies_{tid}.txt"
+    os.makedirs("downloads", exist_ok=True)
+
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'nocheckcertificate': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        }
+    }
+
+    if user_cookies:
+        with open(cookie_path, "w") as f: f.write(user_cookies)
+        ydl_opts['cookiefile'] = cookie_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats = info.get('formats', [])
+            
+            buttons = []
+            seen_res = set()
+            for f in formats:
+                res = f.get('height')
+                f_id = f.get('format_id')
+                if res and res not in seen_res:
+                    ext = f.get('ext', 'mp4')
+                    buttons.append([InlineKeyboardButton(f"🎬 {res}p ({ext})", callback_data=f"dl_{tid}_{f_id}")])
+                    seen_res.add(res)
+            
+            buttons.append([InlineKeyboardButton("🎵 Best Audio", callback_data=f"dl_{tid}_bestaudio")])
+            
+            # Temporary storage for Callback
+            ACTIVE_TASKS[tid] = {
+                'url': url, 'name': name, 'is_extract': is_extract, 
+                'user_id': user_id, 'status': 'Choosing...', 'mention': message.from_user.mention,
+                'user_name': message.from_user.first_name, 'start_time': time.time()
+            }
+
+            await status_msg.edit_text(
+                f"✅ **Video Found:** `{info.get('title')[:60]}...`\n\nSelect Quality to Start Leech:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ **Extraction Error:** `{str(e)}`")
+    finally:
+        if os.path.exists(cookie_path): os.remove(cookie_path)
+
+# --- CALLBACK HANDLER FOR DOWNLOAD ---
+@Client.on_callback_query(filters.regex(r'^dl_'))
+async def dl_callback(client, query):
+    _, tid, f_id = query.data.split("_", 2)
+    if tid not in ACTIVE_TASKS:
+        return await query.answer("❌ Task Expired!", show_alert=True)
+    
+    task = ACTIVE_TASKS[tid]
+    await query.message.edit_text(f"🚀 **Starting Download... Quality ID:** `{f_id}`")
+    asyncio.create_task(process_leech_download(client, query.message, tid, f_id))
+
+async def process_leech_download(client, message, tid, f_id):
     async with semaphore:
+        task = ACTIVE_TASKS[tid]
+        user_id = task['user_id']
+        url, name, is_extract = task['url'], task['name'], task['is_extract']
         d_path = f"downloads/{tid}/"
         os.makedirs(d_path, exist_ok=True)
-        user_id = message.from_user.id
-        ACTIVE_TASKS[tid] = {'name': name, 'curr': 0, 'total': 1, 'status': 'Downloading', 'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 'user_name': message.from_user.first_name, 'user_id': user_id}
+        
         await db.add_task(tid, user_id, name)
-        status_msg = await client.send_message(message.chat.id, "⏳ Initializing Stream Leech...")
-        updater_task = asyncio.create_task(status_updater(status_msg, tid))
+        updater_task = asyncio.create_task(status_updater(message, tid))
 
         def ytdl_hook(d):
             if tid in STOP_TASKS: raise Exception("Cancelled")
             if d['status'] == 'downloading':
-                ACTIVE_TASKS[tid].update({'curr': d.get('downloaded_bytes', 0), 'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1), 'speed': d.get('_speed_str', '0B/s'), 'eta': d.get('_eta_str', 'N/A')})
+                ACTIVE_TASKS[tid].update({
+                    'curr': d.get('downloaded_bytes', 0), 
+                    'total': d.get('total_bytes') or d.get('total_bytes_estimate', 1),
+                    'speed': d.get('_speed_str', '0B/s'), 'eta': d.get('_eta_str', 'N/A')
+                })
 
         try:
-            # Check for User Cookies
             user_cookies = await db.get_cookies(user_id)
-            cookie_path = os.path.join(d_path, f"cookies_{user_id}.txt")
-            
-            # --- UPDATED FORMAT FOR YOUTUBE & LIVE STREAMS ---
             ydl_opts = {
-                # Pehle best video/audio try karega, nahi toh single best file uthayega
-                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
+                'format': f"{f_id}+bestaudio/best",
                 'outtmpl': f'{d_path}%(title)s.%(ext)s',
                 'progress_hooks': [ytdl_hook],
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Origin': 'https://www.youtube.com',
-                    'Referer': 'https://www.youtube.com/',
-                },
-                'hls_prefer_native': True,
-                'retries': 15,
-                'fragment_retries': 15,
-                'geo_bypass': True,
+                'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
+                'hls_prefer_native': True, 'retries': 15, 'geo_bypass': True
             }
-
             if user_cookies:
-                with open(cookie_path, "w") as f: f.write(user_cookies)
-                ydl_opts['cookiefile'] = cookie_path
+                c_path = os.path.join(d_path, "c.txt")
+                with open(c_path, "w") as f: f.write(user_cookies)
+                ydl_opts['cookiefile'] = c_path
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -214,11 +267,12 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             for path in sorted(all_files):
                 if tid in STOP_TASKS: break
                 is_vid = path.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
-                await common_upload_logic(client, message, tid, path, os.path.basename(path), is_vid, status_msg)
+                await common_upload_logic(client, user_id, tid, path, os.path.basename(path), is_vid, task['mention'])
             
             await db.increment_task_stat(user_id)
-            await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
-        except Exception as e: await status_msg.edit_text(f"❌ **Error:** `{str(e)}`")
+            await message.edit_text(f"✅ {task['mention']}, **Leech Done!**")
+        except Exception as e:
+            await message.edit_text(f"❌ **Error:** `{str(e)}`")
         finally:
             updater_task.cancel()
             ACTIVE_TASKS.pop(tid, None)
@@ -239,14 +293,12 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
         try:
             if "drive.google.com" in url:
                 ACTIVE_TASKS[tid]['status'] = "G-Drive Syncing..."
-                # Use user cookies if available for GDrive too
                 user_cookies = await db.get_cookies(user_id)
                 cookie_arg = []
                 if user_cookies:
                     c_path = os.path.join(d_path, "g_cookies.txt")
                     with open(c_path, "w") as f: f.write(user_cookies)
                     cookie_arg = ["--cookie", c_path]
-                
                 cmd = ["gdown", *cookie_arg, "-O", d_path, "--folder", url] if "folders" in url else ["gdown", *cookie_arg, "-O", d_path, url]
                 await (await asyncio.create_subprocess_exec(*cmd)).communicate()
             else:
@@ -280,7 +332,7 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
             for path in sorted(all_files):
                 if tid in STOP_TASKS: break
                 is_vid = os.path.basename(path).lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
-                await common_upload_logic(client, message, tid, path, os.path.basename(path), is_vid, status_msg)
+                await common_upload_logic(client, user_id, tid, path, os.path.basename(path), is_vid, message.from_user.mention)
 
             await db.increment_task_stat(user_id)
             await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
@@ -297,4 +349,3 @@ async def status_cmd(client, message):
     if not ACTIVE_TASKS: return await message.reply_text("❌ **No active tasks!**")
     status_text = await get_status_msg(ACTIVE_TASKS)
     await message.reply_text(status_text)
-
