@@ -23,8 +23,9 @@ class Database:
             "_id": user_id,
             "name": name,
             "tasks_count": 0,
-            "thumb": None,          # Naya: Permanent Thumbnail storage
-            "upload_mode": "Media"  # Naya: Default Upload Mode (Media/Document)
+            "thumb": None,          # Permanent Thumbnail storage
+            "upload_mode": "Media", # Default Upload Mode (Media/Document)
+            "cookies": None         # Naya: Per-user cookies.txt storage
         }
         try:
             await self._users.insert_one(user)
@@ -63,10 +64,20 @@ class Database:
         user = await self._users.find_one({"_id": user_id})
         return user.get("upload_mode", "Media") if user else "Media"
 
+    # --- Cookies Features (Naya Logic) ---
+    async def set_cookies(self, user_id, cookie_text):
+        """User ka cookies.txt file ka text save karta hai."""
+        await self._users.update_one({"_id": user_id}, {"$set": {"cookies": cookie_text}})
+
+    async def get_cookies(self, user_id):
+        """User ka saved cookies text nikalta hai."""
+        user = await self._users.find_one({"_id": user_id})
+        return user.get("cookies", None) if user else None
+
     # --- Real-time Task Features (Purana Logic Intact) ---
     async def add_task(self, tid, user_id, name):
         """Task shuru hote hi DB mein entry banata hai."""
-        import time # Local import to avoid Config issues
+        import time 
         task_data = {
             "_id": tid,
             "user_id": user_id,
