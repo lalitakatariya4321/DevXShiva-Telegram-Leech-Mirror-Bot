@@ -173,18 +173,26 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             user_cookies = await db.get_cookies(user_id)
             cookie_path = os.path.join(d_path, f"cookies_{user_id}.txt")
             
+            # --- UPDATED FORMAT FOR YOUTUBE & LIVE STREAMS ---
             ydl_opts = {
-                'format': 'bestvideo+bestaudio/best',
+                # Pehle best video/audio try karega, nahi toh single best file uthayega
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', 
                 'outtmpl': f'{d_path}%(title)s.%(ext)s',
                 'progress_hooks': [ytdl_hook],
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'referer': 'https://www.hotstar.com/',
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Origin': 'https://www.youtube.com',
+                    'Referer': 'https://www.youtube.com/',
+                },
                 'hls_prefer_native': True,
-                'retries': 10,
-                'fragment_retries': 10
+                'retries': 15,
+                'fragment_retries': 15,
+                'geo_bypass': True,
             }
 
             if user_cookies:
@@ -289,3 +297,4 @@ async def status_cmd(client, message):
     if not ACTIVE_TASKS: return await message.reply_text("❌ **No active tasks!**")
     status_text = await get_status_msg(ACTIVE_TASKS)
     await message.reply_text(status_text)
+
