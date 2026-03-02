@@ -41,7 +41,7 @@ async def cancel_cmd(client, message):
     else:
         await message.reply("❌ **Invalid Task ID or Task not found.**")
 
-# --- FILE PROCESSORS (SPLIT/MERGE) ---
+# --- FILE PROCESSORS (SPLIT/MERGE/EXTRACT) ---
 async def split_file(file_path, tid):
     ACTIVE_TASKS[tid]['status'] = "Splitting..."
     base_name = os.path.basename(file_path)
@@ -53,6 +53,24 @@ async def split_file(file_path, tid):
     await process.communicate()
     if os.path.exists(file_path): os.remove(file_path)
     return sorted([os.path.join(dir_name, f) for f in os.listdir(dir_name) if f.startswith(base_name + ".7z")])
+
+async def extract_zip_only(d_path, tid):
+    """Naya logic: Sirf unzip karne ke liye jab user -e use kare."""
+    ACTIVE_TASKS[tid]['status'] = "Unzipping Episodes..."
+    zip_extensions = ('.zip', '.7z', '.rar', '.001')
+    zip_files = [f for f in os.listdir(d_path) if f.lower().endswith(zip_extensions)]
+    
+    if not zip_files: return False
+
+    for f in zip_files:
+        file_path = os.path.join(d_path, f)
+        cmd = ["7z", "x", file_path, f"-o{d_path}", "-y"]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        await process.communicate()
+        if os.path.exists(file_path): os.remove(file_path)
+    
+    # Cleaning up empty folders if any created during extraction
+    return True
 
 async def extract_and_merge(d_path, tid):
     ACTIVE_TASKS[tid]['status'] = "Merging/Extracting..."
@@ -114,7 +132,7 @@ async def common_upload_logic(client, message, tid, file_path, name, is_video, s
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
             if os.path.exists(path): os.remove(path)
 
-# --- ENGINE 1: YT-DLP (Progress Fixed) ---
+# --- ENGINE 1: YT-DLP ---
 async def leech_logic(client, message, tid, url, name, is_extract=False):
     async with semaphore:
         d_path = f"downloads/{tid}/"
@@ -140,15 +158,20 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             ydl_opts = {'format': 'best', 'outtmpl': f'{d_path}%(title)s.%(ext)s', 'progress_hooks': [ytdl_hook], 'quiet': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                file_path = ydl.prepare_filename(info)
             
-            # YT-DLP mein bhi -e support (Extracting videos from zip if any)
-            if not is_extract: await extract_and_merge(d_path, tid)
+            if is_extract: await extract_zip_only(d_path, tid)
+            else: await extract_and_merge(d_path, tid)
             
-            all_files = [os.path.join(d_path, f) for f in os.listdir(d_path) if os.path.isfile(os.path.join(d_path, f))]
-            for path in all_files:
+            # Recurse through all files even in subfolders
+            all_files = []
+            for root, dirs, files in os.walk(d_path):
+                for file in files:
+                    if not file.startswith("."): all_files.append(os.path.join(root, file))
+
+            for path in sorted(all_files):
                 if tid in STOP_TASKS: break
-                await common_upload_logic(client, message, tid, path, os.path.basename(path), True, status_msg)
+                is_vid = path.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
+                await common_upload_logic(client, message, tid, path, os.path.basename(path), is_vid, status_msg)
             
             await db.increment_task_stat(user_id)
             await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
@@ -173,14 +196,12 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
         updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         try:
-            # CHECK FOR G-DRIVE
             if "drive.google.com" in url:
                 ACTIVE_TASKS[tid]['status'] = "G-Drive Syncing..."
                 cmd = ["gdown", "--cookie", "cookies.txt", "-O", d_path, "--folder", url] if "folders" in url else ["gdown", "--cookie", "cookies.txt", "-O", d_path, url]
                 process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 await process.communicate()
             else:
-                # DIRECT DOWNLOAD
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, timeout=None) as response:
                         if response.status != 200: raise Exception(f"HTTP {response.status}")
@@ -200,12 +221,21 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
                                 speed = dl / elapsed if elapsed > 0 else 0
                                 ACTIVE_TASKS[tid].update({'curr': dl, 'speed': f"{speed/1024/1024:.2f} MB/s", 'eta': get_readable_time((total_size-dl)/speed) if speed > 0 else "N/A"})
 
-            if not is_extract: await extract_and_merge(d_path, tid)
+            if is_extract: await extract_zip_only(d_path, tid)
+            else: await extract_and_merge(d_path, tid)
 
-            all_files = [os.path.join(d_path, f) for f in os.listdir(d_path) if os.path.isfile(os.path.join(d_path, f))]
-            for path in all_files:
+            all_files = []
+            for root, dirs, files in os.walk(d_path):
+                for file in files:
+                    if not file.startswith("."): all_files.append(os.path.join(root, file))
+
+            if not all_files: raise Exception("No files found to upload!")
+
+            for path in sorted(all_files):
                 if tid in STOP_TASKS: break
-                await common_upload_logic(client, message, tid, path, os.path.basename(path), True, status_msg)
+                filename = os.path.basename(path)
+                is_vid = filename.lower().endswith((".mp4", ".mkv", ".mov", ".webm"))
+                await common_upload_logic(client, message, tid, path, filename, is_vid, status_msg)
 
             await db.increment_task_stat(user_id)
             await status_msg.edit_text(f"✅ {message.from_user.mention}, **Leech Done!**")
