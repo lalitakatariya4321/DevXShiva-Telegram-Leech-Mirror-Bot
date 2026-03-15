@@ -10,7 +10,7 @@ from bot.helpers.progress import get_status_msg
 MAX_SIZE = 1.9 * 1024 * 1024 * 1024 # 1.9GB
 ACTIVE_TASKS = {}
 STOP_TASKS = []
-semaphore = asyncio.Semaphore(5)
+semaphore = asyncio.Semaphore(10) # Tasks limit increased for performance
 
 # --- STATUS UPDATER ---
 async def status_updater(msg, tid):
@@ -42,7 +42,7 @@ async def cancel_cmd(client, message):
     else:
         await message.reply("❌ **Invalid Task ID or Task not found.**")
 
-# --- FILE PROCESSORS (SPLIT/MERGE/EXTRACT) ---
+# --- FILE PROCESSORS ---
 async def split_file(file_path, tid):
     ACTIVE_TASKS[tid]['status'] = "Splitting..."
     base_name = os.path.basename(file_path)
@@ -152,7 +152,7 @@ async def common_upload_logic(client, user_id, tid, file_path, name, is_video, m
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
             if os.path.exists(path): os.remove(path)
 
-# --- AUTO-BEST QUALITY LEECH ENGINE ---
+# --- AUTO-BEST QUALITY LEECH ENGINE (M3U8 FAST) ---
 async def leech_logic(client, message, tid, url, name, is_extract=False):
     async with semaphore:
         d_path = f"downloads/{tid}/"
@@ -168,7 +168,7 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
         }
         
         await db.add_task(tid, user_id, name)
-        status_msg = await client.send_message(message.chat.id, "⏳ **Starting Best Quality Leech...**")
+        status_msg = await client.send_message(message.chat.id, "⚡ **Fast M3U8/Video Download Started...**")
         updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         def ytdl_hook(d):
@@ -184,19 +184,23 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
         try:
             user_cookies = await db.get_cookies(user_id)
             ydl_opts = {
-                # BEST VIDEO + BEST AUDIO (MP4/MKV)
                 'format': 'bestvideo+bestaudio/best',
                 'outtmpl': f'{d_path}%(title)s.%(ext)s',
                 'progress_hooks': [ytdl_hook],
                 'quiet': True,
                 'no_warnings': True,
                 'nocheckcertificate': True,
+                # SPEED BOOST SETTINGS
+                'external_downloader': 'aria2c',
+                'external_downloader_args': ['-x', '16', '-s', '16', '-k', '1M'],
+                'concurrent_fragment_downloads': 15,
+                'hls_use_mpegts': True,
+                'retries': 15,
+                'fragment_retries': 15,
+                'geo_bypass': True,
                 'http_headers': {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                 },
-                'hls_prefer_native': True,
-                'retries': 15,
-                'geo_bypass': True,
             }
 
             if user_cookies:
@@ -233,7 +237,7 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             shutil.rmtree(d_path, ignore_errors=True)
             await db.rm_task(tid)
 
-# --- ENGINE 2: DIRECT & G-DRIVE (Pehle Jaisa Hi Rahega) ---
+# --- ENGINE 2: DIRECT & G-DRIVE ---
 async def direct_download_logic(client, message, tid, url, name, is_extract):
     async with semaphore:
         d_path = f"downloads/{tid}/"
@@ -241,7 +245,7 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
         user_id = message.from_user.id
         ACTIVE_TASKS[tid] = {'name': name if name != "default" else "Initializing...", 'curr': 0, 'total': 1, 'status': 'Downloading...', 'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 'user_name': message.from_user.first_name, 'user_id': user_id}
         await db.add_task(tid, user_id, name)
-        status_msg = await client.send_message(message.chat.id, "⏳ Initializing...")
+        status_msg = await client.send_message(message.chat.id, "⏳ Initializing Direct Download...")
         updater_task = asyncio.create_task(status_updater(status_msg, tid))
 
         try:
@@ -256,6 +260,7 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
                 cmd = ["gdown", *cookie_arg, "-O", d_path, "--folder", url] if "folders" in url else ["gdown", *cookie_arg, "-O", d_path, url]
                 await (await asyncio.create_subprocess_exec(*cmd)).communicate()
             else:
+                # Fast Direct Download using aiohttp
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, timeout=None) as response:
                         if response.status != 200: raise Exception(f"HTTP {response.status}")
@@ -299,7 +304,7 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
 
 # --- STATUS COMMAND ---
 @Client.on_message(filters.command("status"))
-async def status_cmd(client, message):
+async def status_cmd_handler(client, message):
     if not ACTIVE_TASKS: return await message.reply_text("❌ **No active tasks!**")
     status_text = await get_status_msg(ACTIVE_TASKS)
     await message.reply_text(status_text)
