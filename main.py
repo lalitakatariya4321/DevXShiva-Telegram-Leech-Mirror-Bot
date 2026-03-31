@@ -282,7 +282,7 @@ async def del_thumb_cmd(c, m):
 
 # --- Runner ---
 async def run():
-    threading.Thread(target=lambda: web_app.run(host="0.0.0.0", port=10000), daemon=True).start()
+    threading.Thread(target=lambda: web_app.run(host="0.0.0.0", port=8000), daemon=True).start()
     await app.start()
     print("Bot Started!")
     await idle()
