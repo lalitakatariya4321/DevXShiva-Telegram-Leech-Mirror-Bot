@@ -112,6 +112,8 @@ async def extract_and_merge(d_path, tid, user_id):
 # --- UPLOAD LOGIC ---
 async def common_upload_logic(client, user_id, tid, file_path, name, is_video, mention):
     d_path = os.path.dirname(file_path)
+    duration = ACTIVE_TASKS[tid].get('duration', 0) # Get duration for video fix
+    
     if os.path.getsize(file_path) > MAX_SIZE:
         files_to_upload = await split_file(file_path, tid)
     else:
@@ -142,7 +144,16 @@ async def common_upload_logic(client, user_id, tid, file_path, name, is_video, m
         caption = f"✅ **Leeched:** `{clean_name}`{part_info}\n\n👤 **Requested by:** {mention}"
         try:
             if upload_mode == "Media" and is_video:
-                sent = await client.send_video(chat_id=user_id, video=path, thumb=ph_path, caption=caption, supports_streaming=True, progress=up_prog)
+                # FIXED: Added duration and video metadata
+                sent = await client.send_video(
+                    chat_id=user_id, 
+                    video=path, 
+                    thumb=ph_path, 
+                    caption=caption, 
+                    duration=int(duration),
+                    supports_streaming=True, 
+                    progress=up_prog
+                )
             else:
                 sent = await client.send_document(chat_id=user_id, document=path, thumb=ph_path, caption=caption, file_name=clean_name, progress=up_prog)
             try: await sent.copy(Config.DUMP_CHAT_ID)
@@ -152,7 +163,7 @@ async def common_upload_logic(client, user_id, tid, file_path, name, is_video, m
             if ph_path and os.path.exists(ph_path): os.remove(ph_path)
             if os.path.exists(path): os.remove(path)
 
-# --- AUTO-BEST QUALITY LEECH ENGINE (M3U8 FIX) ---
+# --- AUTO-BEST QUALITY LEECH ENGINE (M3U8 & DURATION FIX) ---
 async def leech_logic(client, message, tid, url, name, is_extract=False):
     async with semaphore:
         d_path = f"downloads/{tid}/"
@@ -164,7 +175,8 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             'curr': 0, 'total': 1, 'status': 'Downloading', 
             'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 
             'user_name': message.from_user.first_name, 'user_id': user_id,
-            'mention': message.from_user.mention
+            'mention': message.from_user.mention,
+            'duration': 0
         }
         
         await db.add_task(tid, user_id, name)
@@ -174,13 +186,11 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
         def ytdl_hook(d):
             if tid in STOP_TASKS: raise Exception("Cancelled")
             if d['status'] == 'downloading':
-                # FIX: Use estimated bytes if total_bytes is None (Common in M3U8)
                 total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
                 curr = d.get('downloaded_bytes', 0)
-                
                 ACTIVE_TASKS[tid].update({
                     'curr': curr, 
-                    'total': total if total > 0 else curr + 1, # Avoid 0 total
+                    'total': total if total > 0 else curr + 1,
                     'speed': d.get('_speed_str', '0B/s'), 
                     'eta': d.get('_eta_str', 'N/A')
                 })
@@ -197,7 +207,7 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
                 'external_downloader': 'aria2c',
                 'external_downloader_args': ['-x', '16', '-s', '16', '-k', '1M'],
                 'concurrent_fragment_downloads': 15,
-                'hls_use_mpegts': True,
+                'hls_use_mpegts': False, # FIXED: Better for MP4 fragments
                 'retries': 15,
                 'fragment_retries': 15,
                 'geo_bypass': True,
@@ -214,6 +224,8 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if name == "default": ACTIVE_TASKS[tid]['name'] = info.get('title', 'Video')
+                # FIXED: Storing duration for send_video
+                ACTIVE_TASKS[tid]['duration'] = info.get('duration', 0)
 
             if is_extract: await extract_zip_only(d_path, tid)
             else: await extract_and_merge(d_path, tid, user_id)
@@ -240,7 +252,7 @@ async def leech_logic(client, message, tid, url, name, is_extract=False):
             shutil.rmtree(d_path, ignore_errors=True)
             await db.rm_task(tid)
 
-# --- ENGINE 2: DIRECT & G-DRIVE (AIOHTTP FIX) ---
+# --- ENGINE 2: DIRECT & G-DRIVE ---
 async def direct_download_logic(client, message, tid, url, name, is_extract):
     async with semaphore:
         d_path = f"downloads/{tid}/"
@@ -251,7 +263,8 @@ async def direct_download_logic(client, message, tid, url, name, is_extract):
             'curr': 0, 'total': 1, 'status': 'Downloading...', 
             'speed': '0B/s', 'eta': 'N/A', 'start_time': time.time(), 
             'user_name': message.from_user.first_name, 'user_id': user_id,
-            'mention': message.from_user.mention
+            'mention': message.from_user.mention,
+            'duration': 0
         }
         await db.add_task(tid, user_id, name)
         status_msg = await client.send_message(message.chat.id, "⏳ Initializing Direct Download...")
